@@ -13,22 +13,23 @@ import "../interfaces/badger/IController.sol";
 
 import {BaseStrategy} from "../deps/BaseStrategy.sol";
 
+import {IRibbonVault} from "../interfaces/ribbon/IRibbonVault.sol";
+import {VegaHedge} from "./VegaHedge.sol";
+
 contract MyStrategy is BaseStrategy {
     using SafeERC20Upgradeable for IERC20Upgradeable;
     using AddressUpgradeable for address;
     using SafeMathUpgradeable for uint256;
 
     // address public want // Inherited from BaseStrategy, the token the strategy wants, swaps into and tries to grow
-    address public lpComponent; // Token we provide liquidity with
-    address public reward; // Token we farm and swap to want / lpComponent
+    // address public reward; // Token we farm and swap to want
 
-    // Used to signal to the Badger Tree that rewards where sent to it
-    event TreeDistribution(
-        address indexed token,
-        uint256 amount,
-        uint256 indexed blockNumber,
-        uint256 timestamp
-    );
+    VegaHedge public constant strategy =
+        VegaHedge(); /** address(0)*/
+    IRibbonVault public constant RIBBON_WBTC_COVERED_CALL =
+        IRibbonVault(0x65a833afDc250D9d38f8CD9bC2B1E3132dB13B2F);
+    bool public withdrawInitiated;
+    uint256 PERCENT_HEDGE = 30;
 
     function initialize(
         address _governance,
@@ -48,15 +49,24 @@ contract MyStrategy is BaseStrategy {
         );
         /// @dev Add config here
         want = _wantConfig[0];
-        lpComponent = _wantConfig[1];
-        reward = _wantConfig[2];
 
         performanceFeeGovernance = _feeConfig[0];
         performanceFeeStrategist = _feeConfig[1];
         withdrawalFee = _feeConfig[2];
 
         /// @dev do one off approvals here
-        // IERC20Upgradeable(want).safeApprove(gauge, type(uint256).max);
+        IERC20Upgradeable(want).safeApprove(
+            address(RIBBON_WBTC_COVERED_CALL),
+            type(uint256).max
+        );
+
+        IERC20Upgradeable(want).safeApprove(
+            address(strategy),
+            type(uint256).max
+        );
+
+        /// @dev uniswap approvals
+        // IERC20Upgradeable(reward).safeApprove(ROUTER, type(uint256).max);
     }
 
     /// ===== View Functions =====
@@ -73,12 +83,12 @@ contract MyStrategy is BaseStrategy {
 
     /// @dev Balance of want currently held in strategy positions
     function balanceOfPool() public view override returns (uint256) {
-        return 0;
+        return RIBBON_WBTC_COVERED_CALL.accountVaultBalance(address(this));
     }
 
     /// @dev Returns true if this strategy requires tending
     function isTendable() public view override returns (bool) {
-        return true;
+        return balanceOfWant() > 0;
     }
 
     // @dev These are the tokens that cannot be moved except by the vault
@@ -88,11 +98,14 @@ contract MyStrategy is BaseStrategy {
         override
         returns (address[] memory)
     {
-        address[] memory protectedTokens = new address[](3);
+        address[] memory protectedTokens = new address[](1);
         protectedTokens[0] = want;
-        protectedTokens[1] = lpComponent;
-        protectedTokens[2] = reward;
+
         return protectedTokens;
+    }
+
+    function getStrategyShares() internal view returns (uint256) {
+        return IRibbonVault(RIBBON_WBTC_COVERED_CALL).shares(address(this));
     }
 
     /// ===== Internal Core Implementations =====
@@ -112,58 +125,39 @@ contract MyStrategy is BaseStrategy {
     /// @dev invest the amount of want
     /// @notice When this function is called, the controller has already sent want to this
     /// @notice Just get the current balance and then invest accordingly
-    function _deposit(uint256 _amount) internal override {}
+    function _deposit(uint256 _amount) internal override {
+        RIBBON_WBTC_COVERED_CALL.deposit(_amount);
+    }
 
     /// @dev utility function to withdraw everything for migration
-    function _withdrawAll() internal override {}
+    function _withdrawAll() internal override {
+        if (withdrawInitiated) RIBBON_WBTC_COVERED_CALL.completeWithdraw();
+        if (strategy.withdrawScheduled()) strategy.completeWithdraw();
+    }
 
-    /// @dev withdraw the specified amount of want, liquidate from lpComponent to want, paying off any necessary debt for the conversion
+    /// @dev withdraw the specified amount of want
     function _withdrawSome(uint256 _amount)
         internal
         override
         returns (uint256)
     {
+        uint256 maxAmount =
+            RIBBON_WBTC_COVERED_CALL.pricePerShare().mul(getStrategyShares());
+        if (_amount > maxAmount) {
+            _amount = getStrategyShares();
+            strategy.scheduleWithdraw();
+        } else {
+            _amount = _amount.div(RIBBON_WBTC_COVERED_CALL.pricePerShare());
+        }
+
+        RIBBON_WBTC_COVERED_CALL.initiateWithdraw(uint128(_amount));
+        withdrawInitiated = true;
+
         return _amount;
     }
 
     /// @dev Harvest from strategy mechanics, realizing increase in underlying position
-    function harvest() external whenNotPaused returns (uint256 harvested) {
-        _onlyAuthorizedActors();
-
-        uint256 _before = IERC20Upgradeable(want).balanceOf(address(this));
-
-        // Write your code here
-
-        uint256 earned =
-            IERC20Upgradeable(want).balanceOf(address(this)).sub(_before);
-
-        /// @notice Keep this in so you get paid!
-        (uint256 governancePerformanceFee, uint256 strategistPerformanceFee) =
-            _processRewardsFees(earned, want);
-
-        // TODO: If you are harvesting a reward token you're not compounding
-        // You probably still want to capture fees for it
-        // // Process Sushi rewards if existing
-        // if (sushiAmount > 0) {
-        //     // Process fees on Sushi Rewards
-        //     // NOTE: Use this to receive fees on the reward token
-        //     _processRewardsFees(sushiAmount, SUSHI_TOKEN);
-
-        //     // Transfer balance of Sushi to the Badger Tree
-        //     // NOTE: Send reward to badgerTree
-        //     uint256 sushiBalance = IERC20Upgradeable(SUSHI_TOKEN).balanceOf(address(this));
-        //     IERC20Upgradeable(SUSHI_TOKEN).safeTransfer(badgerTree, sushiBalance);
-        //
-        //     // NOTE: Signal the amount of reward sent to the badger tree
-        //     emit TreeDistribution(SUSHI_TOKEN, sushiBalance, block.number, block.timestamp);
-        // }
-
-        /// @dev Harvest event that every strategy MUST have, see BaseStrategy
-        emit Harvest(earned, block.number);
-
-        /// @dev Harvest must return the amount of want increased
-        return earned;
-    }
+    function harvest() external whenNotPaused returns (uint256 harvested) {}
 
     // Alternative Harvest with Price received from harvester, used to avoid exessive front-running
     function harvest(uint256 price)
@@ -175,6 +169,15 @@ contract MyStrategy is BaseStrategy {
     /// @dev Rebalance, Compound or Pay off debt here
     function tend() external whenNotPaused {
         _onlyAuthorizedActors();
+
+        uint256 toDeposit = balanceOfWant();
+
+        if (toDeposit > 0) {
+            uint256 hedgeAmt = toDeposit.mul(PERCENT_HEDGE).div(100);
+
+            RIBBON_WBTC_COVERED_CALL.deposit(toDeposit.sub(hedgeAmt));
+            strategy.deposit(hedgeAmt);
+        }
     }
 
     /// ===== Internal Helper Functions =====
