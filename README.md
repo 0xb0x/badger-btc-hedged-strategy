@@ -3,17 +3,18 @@ This strategy combines call options to hedge volatility [(vega hedging](https://
 
 Also due to the nature of withdrawals from the ribbon vault, the following function inplementations were changed to enable our strategy to remain compatible with badger:
 
-`_withdrawSome(amount)` -> This initiates a withdrawal from the ribbon vault which could be completed later in the future
+`_withdrawSome(amount)` -> This initiates a withdrawal from the ribbon vault and our hedging strategy which could be completed later in the future
 
-`_withdrawAll()` -> This completes an already initiated withdrawal from ribbon vault.
+`_withdrawAll()` -> This completes an already initiated withdrawal from the ribbon vault and hedging strategy.
 
 # todo
-do more research
-write tests for current strategy
+- do more research
+- write tests for current strategy
 
 
 # helpful links
 https://www.opyn.co
+
 https://www.ribbon.finance
 
 # note
